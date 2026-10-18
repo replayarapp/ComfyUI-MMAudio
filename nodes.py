@@ -28,7 +28,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float) -> tuple[torch.Tensor, torch.Tensor, float]:
+def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float, fps: float = 0.0) -> tuple[torch.Tensor, torch.Tensor, float]:
     _CLIP_SIZE = 384
     _CLIP_FPS = 8.0
 
@@ -53,22 +53,39 @@ def process_video_tensor(video_tensor: torch.Tensor, duration_sec: float) -> tup
 
     # Assuming video_tensor is in the shape (frames, height, width, channels)
     total_frames = video_tensor.shape[0]
-    clip_frames_count = int(_CLIP_FPS * duration_sec)
-    sync_frames_count = int(_SYNC_FPS * duration_sec)
+    if fps and fps > 0:
+        # The batch was recorded at `fps`: resample it to the 8 fps CLIP stream and the
+        # 25 fps Synchformer stream over the whole duration, like the MMAudio video
+        # loader does, instead of taking the first frames as if they were at those rates.
+        src_len = total_frames / float(fps)
+        if duration_sec > src_len + 1e-6:
+            log.warning(f'Video is {src_len:.2f} s, shorter than the requested {duration_sec:.2f} s; truncating')
+            duration_sec = src_len
 
-    # Adjust duration if there are not enough frames
-    if total_frames < clip_frames_count:
-        log.warning(f'Clip video is too short: {total_frames / _CLIP_FPS:.2f} < {duration_sec:.2f}')
-        clip_frames_count = total_frames
-        duration_sec = total_frames / _CLIP_FPS
+        def _resample(rate):
+            n = max(1, int(rate * duration_sec))
+            idx = (torch.arange(n, dtype=torch.float64) * (float(fps) / rate)).floor().long().clamp_(max=total_frames - 1)
+            return video_tensor[idx.to(video_tensor.device)]
 
-    if total_frames < sync_frames_count:
-        log.warning(f'Sync video is too short: {total_frames / _SYNC_FPS:.2f} < {duration_sec:.2f}, truncating to {total_frames / _SYNC_FPS:.2f} sec')
-        sync_frames_count = total_frames
-        duration_sec = total_frames / _SYNC_FPS
+        clip_frames = _resample(_CLIP_FPS)
+        sync_frames = _resample(_SYNC_FPS)
+    else:
+        clip_frames_count = int(_CLIP_FPS * duration_sec)
+        sync_frames_count = int(_SYNC_FPS * duration_sec)
 
-    clip_frames = video_tensor[:clip_frames_count]
-    sync_frames = video_tensor[:sync_frames_count]
+        # Adjust duration if there are not enough frames
+        if total_frames < clip_frames_count:
+            log.warning(f'Clip video is too short: {total_frames / _CLIP_FPS:.2f} < {duration_sec:.2f}')
+            clip_frames_count = total_frames
+            duration_sec = total_frames / _CLIP_FPS
+
+        if total_frames < sync_frames_count:
+            log.warning(f'Sync video is too short: {total_frames / _SYNC_FPS:.2f} < {duration_sec:.2f}, truncating to {total_frames / _SYNC_FPS:.2f} sec')
+            sync_frames_count = total_frames
+            duration_sec = total_frames / _SYNC_FPS
+
+        clip_frames = video_tensor[:clip_frames_count]
+        sync_frames = video_tensor[:sync_frames_count]
 
     clip_frames = clip_frames.permute(0, 3, 1, 2)
     sync_frames = sync_frames.permute(0, 3, 1, 2)
@@ -309,6 +326,7 @@ class MMAudioSampler:
             },
             "optional": {
                 "images": ("IMAGE",),
+                "fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 0.01, "tooltip": "Frame rate of the images input. When > 0 the frames are resampled to the 8 fps CLIP and 25 fps Synchformer streams over the whole duration, so the audio covers the real clip length. 0 keeps the previous behaviour (the first frames are used as-is)"}),
             },
         }
 
@@ -317,7 +335,7 @@ class MMAudioSampler:
     FUNCTION = "sample"
     CATEGORY = "MMAudio"
 
-    def sample(self, mmaudio_model, seed, feature_utils, duration, steps, cfg, prompt, negative_prompt, mask_away_clip, force_offload, images=None):
+    def sample(self, mmaudio_model, seed, feature_utils, duration, steps, cfg, prompt, negative_prompt, mask_away_clip, force_offload, images=None, fps=0.0):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         rng = torch.Generator(device=device)
@@ -327,7 +345,7 @@ class MMAudioSampler:
        
         if images is not None:
             images = images.to(device=device)
-            clip_frames, sync_frames, duration = process_video_tensor(images, duration)
+            clip_frames, sync_frames, duration = process_video_tensor(images, duration, fps)
             print("clip_frames", clip_frames.shape, "sync_frames", sync_frames.shape, "duration", duration)
             if mask_away_clip:
                 clip_frames = None
